@@ -37,10 +37,26 @@ DEFAULT_CSV = Path("")
 
 # ── API fetch logic ────────────────────────────────────────────────────────────
 
+_TICKETS_URL = "https://api.shotgun.live/tickets"
+_TIMEOUT     = 60
+_MAX_RETRIES = 3
+
+
 def _api_get(url: str, params: dict, token: str) -> dict:
-    resp = requests.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    headers = {"Authorization": f"Bearer {token}"}
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.Timeout:
+            if attempt == _MAX_RETRIES:
+                raise requests.Timeout(
+                    f"A API do Shotgun não respondeu após {_MAX_RETRIES} tentativas "
+                    f"({_TIMEOUT}s cada). Tente novamente em alguns instantes."
+                )
+        except requests.HTTPError:
+            raise
 
 
 def _parse_after(next_url: str) -> str | None:
@@ -65,7 +81,7 @@ def fetch_tickets_from_api(token: str, organizer_id: str,
     while True:
         if cursor:
             params["after"] = cursor
-        data = _api_get("https://api.shotgun.live/tickets", params, token)
+        data = _api_get(_TICKETS_URL, params, token)
         records = data.get("data", [])
         next_url = data.get("pagination", {}).get("next")
         all_records.extend(records)
@@ -173,6 +189,8 @@ with st.sidebar:
                 st.session_state["source_label"] = f"API ao vivo — {len(raw):,} ingressos"
                 prog.empty()
                 st.success(f"{len(raw):,} ingressos carregados com sucesso.")
+            except requests.Timeout as e:
+                st.error(f"⏱️ {e}")
             except requests.HTTPError as e:
                 st.error(f"Erro na API {e.response.status_code}: {e.response.text[:200]}")
             except Exception as e:
