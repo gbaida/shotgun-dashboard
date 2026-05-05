@@ -32,7 +32,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-COLORS = px.colors.qualitative.Vivid
+COLORS = px.colors.qualitative.Plotly
 DEFAULT_CSV = Path("")
 
 # ── API fetch logic ────────────────────────────────────────────────────────────
@@ -190,6 +190,9 @@ with st.sidebar:
 
     if "df" in st.session_state:
         st.caption(f"Fonte: {st.session_state.get('source_label', '')}")
+
+    st.divider()
+    st.caption("Gostou? Pix e sugestões para gustavobaida@gmail.com")
 
 
 # ── Tela de boas-vindas ────────────────────────────────────────────────────────
@@ -382,9 +385,8 @@ with col_main:
                 hourly, x="order_hour", y="ingressos",
                 labels={"order_hour": "Hora do Dia", "ingressos": "Ingressos Vendidos"},
                 title="Vendas por Hora do Dia",
-                color="ingressos", color_continuous_scale="Blues",
+                color_discrete_sequence=[COLORS[0]],
             )
-            fig3.update_coloraxes(showscale=False)
             col_l2.plotly_chart(fig3, use_container_width=True)
 
         if "days_before_event" in dff.columns:
@@ -396,9 +398,8 @@ with col_main:
                 x="days_before_bucket", y="ingressos",
                 labels={"days_before_bucket": "Dias Antes do Evento", "ingressos": "Ingressos Vendidos"},
                 title="Quando as Pessoas Compraram? (Dias Antes do Evento)",
-                color="ingressos", color_continuous_scale="Teal",
+                color_discrete_sequence=[COLORS[2]],
             )
-            fig4.update_coloraxes(showscale=False)
             col_r2.plotly_chart(fig4, use_container_width=True)
 
         st.subheader("Resumo por Evento")
@@ -426,6 +427,21 @@ with col_main:
         else:
             col_l, col_r = st.columns(2)
 
+            vol_ev = (
+                dff.groupby(["event_name", "deal_title"])
+                .agg(ingressos=("ticket_id", "count"), receita=("deal_price_brl", "sum"))
+                .reset_index()
+            )
+            fig2 = px.bar(
+                vol_ev, x="event_name", y="ingressos", color="deal_title",
+                barmode="stack",
+                labels={"event_name": "Evento", "ingressos": "Ingressos", "deal_title": "Categoria"},
+                title="Volume de Ingressos por Evento e Categoria",
+                color_discrete_sequence=COLORS,
+            )
+            fig2.update_layout(xaxis_tickangle=-20, legend=dict(orientation="h", y=-0.3))
+            col_l.plotly_chart(fig2, use_container_width=True)
+
             rev_tier = (
                 dff.groupby("deal_title")
                 .agg(ingressos=("ticket_id", "count"), receita=("deal_price_brl", "sum"))
@@ -439,15 +455,7 @@ with col_main:
             )
             fig.update_traces(texttemplate="R$%{text:,.0f}", textposition="outside")
             fig.update_layout(showlegend=False, xaxis_tickangle=-20)
-            col_l.plotly_chart(fig, use_container_width=True)
-
-            fig2 = px.pie(
-                rev_tier, names="deal_title", values="ingressos",
-                title="Volume de Ingressos por Categoria",
-                color_discrete_sequence=COLORS, hole=0.4,
-            )
-            fig2.update_traces(textinfo="percent+label")
-            col_r.plotly_chart(fig2, use_container_width=True)
+            col_r.plotly_chart(fig, use_container_width=True)
 
             col_l2, col_r2 = st.columns(2)
 
@@ -475,7 +483,7 @@ with col_main:
             fig4 = px.pie(
                 fp, names="tipo", values="quantidade",
                 title="Ingressos Gratuitos vs Pagos",
-                color_discrete_map={"Gratuito": "#636EFA", "Pago": "#EF553B"}, hole=0.4,
+                color_discrete_sequence=COLORS, hole=0.4,
             )
             fig4.update_traces(textinfo="percent+value")
             col_r2.plotly_chart(fig4, use_container_width=True)
@@ -599,10 +607,9 @@ with col_main:
                 cities, x="participantes", y="cidade", orientation="h",
                 labels={"cidade": "Cidade", "participantes": "Participantes"},
                 title="Top 15 Cidades",
-                color="participantes", color_continuous_scale="Blues", text="participantes",
+                color_discrete_sequence=[COLORS[0]], text="participantes",
             )
             fig3.update_traces(textposition="outside")
-            fig3.update_coloraxes(showscale=False)
             fig3.update_layout(yaxis={"categoryorder": "total ascending"})
             col_l2.plotly_chart(fig3, use_container_width=True)
 
@@ -616,7 +623,7 @@ with col_main:
             fig4 = px.pie(
                 optin, names="status", values="quantidade",
                 title="Taxa de Opt-in Newsletter",
-                color_discrete_map={"Inscrito": "#00CC96", "Não Inscrito": "#EF553B"}, hole=0.4,
+                color_discrete_sequence=COLORS, hole=0.4,
             )
             fig4.update_traces(textinfo="percent+value")
             col_r2.plotly_chart(fig4, use_container_width=True)
@@ -635,10 +642,9 @@ with col_main:
                 x="label", y="participantes",
                 labels={"label": "Eventos Frequentados", "participantes": "Participantes"},
                 title="Participantes Recorrentes",
-                color="participantes", color_continuous_scale="Greens", text="participantes",
+                color_discrete_sequence=[COLORS[2]], text="participantes",
             )
             fig5.update_traces(textposition="outside")
-            fig5.update_coloraxes(showscale=False)
             st.plotly_chart(fig5, use_container_width=True)
 
         if "age" in dff.columns and "contact_gender" in dff.columns:
@@ -696,11 +702,10 @@ with col_main:
             cancel_ev, x="event_name", y="taxa_cancelamento",
             labels={"event_name": "Evento", "taxa_cancelamento": "Taxa de Cancelamento (%)"},
             title="Taxa de Cancelamento por Evento",
-            color="taxa_cancelamento", color_continuous_scale="Reds",
+            color_discrete_sequence=[COLORS[1]],
             text=cancel_ev["taxa_cancelamento"].round(1).astype(str) + "%",
         )
         fig2.update_traces(textposition="outside")
-        fig2.update_coloraxes(showscale=False)
         fig2.update_layout(xaxis_tickangle=-20)
         col_r.plotly_chart(fig2, use_container_width=True)
 
