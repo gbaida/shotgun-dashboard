@@ -144,7 +144,7 @@ with st.sidebar:
     # ── Opção 1: Buscar via API ────────────────────────────────────────────────
     st.markdown("### Buscar via API")
     st.caption("[Como descobrir os seus dados de API](https://support-pro.shotgun.live/hc/en-us/articles/33561354477970-Find-your-Organizer-id-and-API-token#h_01KJ7K6DYV1FWN0AD6NRV5W1XE)")
-    api_token    = st.text_input("Token de API", type="password", placeholder="eyJhbGci...")
+    api_token    = st.text_input("Token de API", type="password", placeholder="ayyeasdi...")
     organizer_id = st.text_input("ID do Organizador", placeholder="123456")
 
     with st.expander("Opções avançadas"):
