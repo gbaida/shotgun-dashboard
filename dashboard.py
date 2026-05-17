@@ -454,9 +454,11 @@ if _sb_is_configured():
             _pkce_resp = _sb.auth.exchange_code_for_session(
                 {"auth_code": _pkce_code, "code_verifier": _pkce_ver}
             )
+            _new_rt = _pkce_resp.session.refresh_token
             st.session_state["sb_access_token"]  = _pkce_resp.session.access_token
-            st.session_state["sb_refresh_token"] = _pkce_resp.session.refresh_token
+            st.session_state["sb_refresh_token"] = _new_rt
             st.query_params.clear()
+            st.query_params["_sb_rt"] = _new_rt   # persiste entre page refreshes
             st.rerun()
         except Exception as _pkce_err:
             st.error(f"Erro ao completar login com Google: {_pkce_err}")
@@ -484,6 +486,22 @@ if _sb_is_configured():
             st.session_state.pop("sb_refresh_token", None)
             _sb_user = None
 
+    # Fallback: refresh token persistido na URL — sobrevive a page refresh (F5)
+    if _sb_user is None:
+        _url_rt = st.query_params.get("_sb_rt", "")
+        if _url_rt:
+            try:
+                _ref = _sb.auth._call_refresh_token(_url_rt)
+                _sb.auth._save_session(_ref.session)
+                _sb_user = _ref.user
+                st.session_state["sb_access_token"] = _ref.session.access_token
+                st.session_state["sb_refresh_token"] = _ref.session.refresh_token
+                # Atualiza RT na URL caso o servidor tenha rotacionado o token
+                st.query_params["_sb_rt"] = _ref.session.refresh_token
+            except Exception:
+                st.query_params.pop("_sb_rt", None)
+                _sb_user = None
+
 else:
     # Supabase não configurado — bloqueia o app em vez de abrir sem auth.
     # Em produção isso indica que os secrets não foram adicionados ao Streamlit Cloud.
@@ -499,6 +517,8 @@ if _sb_user is None and not st.session_state.get("sb_guest"):
     _render_login_page()
     st.stop()
 
+# ── Pós-login: migração local → DB e carga de ingressos salvos ────────────────
+if _SB_MODE and _sb_user:
     # ── Migração única: porta_entries.json → DB ────────────────────────────────
     _migrated_flag = PORTA_PATH.with_name("porta_entries.imported.json")
     if PORTA_PATH.is_file() and not _migrated_flag.is_file():
@@ -559,6 +579,7 @@ with st.sidebar:
                 st.session_state.pop(_k, None)
             for _k in [k for k in st.session_state if k.startswith("evt_")]:
                 del st.session_state[_k]
+            st.query_params.clear()   # remove _sb_rt da URL
             st.rerun()
 
     if "df" in st.session_state:
