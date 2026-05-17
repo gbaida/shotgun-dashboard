@@ -1,3 +1,5 @@
 streamlit
 pandas
 plotly
+requests
+supabase>=2.0.0

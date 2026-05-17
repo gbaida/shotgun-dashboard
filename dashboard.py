@@ -3,10 +3,13 @@ Shotgun Event Analytics Dashboard
 Run with: python -m streamlit run dashboard.py
 """
 
+import base64 as _b64
+import hashlib as _hl
 import json
+import os as _os
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 import pandas as pd
 import plotly.express as px
@@ -14,8 +17,30 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+# ── Supabase (opcional) ───────────────────────────────────────────────────────
+_SB_AVAIL = False
+try:
+    from supabase import create_client as _sb_create_client
+    _SB_AVAIL = True
+except ImportError:
+    pass
+
+# Estas variáveis são inicializadas antes do sidebar (veja bloco _SB_INIT abaixo)
+_SB_MODE: bool = False
+_sb        = None   # supabase.Client
+_sb_user   = None   # supabase.User
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """Gera (code_verifier, code_challenge) para PKCE OAuth."""
+    verifier  = _b64.urlsafe_b64encode(_os.urandom(32)).decode().rstrip("=")
+    challenge = _b64.urlsafe_b64encode(
+        _hl.sha256(verifier.encode()).digest()
+    ).decode().rstrip("=")
+    return verifier, challenge
+
 st.set_page_config(
-    page_title="Shotgun Analytics",
+    page_title="Clubber Analytics",
     page_icon="🎟️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -90,6 +115,31 @@ def fetch_tickets_from_api(token: str, organizer_id: str, progress=None) -> pd.D
     return pd.DataFrame(all_records)
 
 
+# ── JSON serialization helper (used when persisting to Supabase) ───────────────
+import math as _math
+
+def _sanitize_for_json(v):
+    """Convert non-JSON-serializable pandas/numpy scalars to Python-native types."""
+    if v is None:
+        return None
+    try:
+        if pd.isnull(v):          # catches NaT, NaN, None
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, float) and (_math.isnan(v) or _math.isinf(v)):
+        return None
+    if hasattr(v, "isoformat"):   # Timestamp / datetime / date → ISO string
+        return v.isoformat()
+    if hasattr(v, "item"):        # numpy int64 / float64 → Python native
+        return v.item()
+    return v
+
+
+def _sanitize_record(record: dict) -> dict:
+    return {k: _sanitize_for_json(val) for k, val in record.items()}
+
+
 # ── Data processing ────────────────────────────────────────────────────────────
 
 def process(df: pd.DataFrame) -> pd.DataFrame:
@@ -147,6 +197,24 @@ PORTA_PATH = Path(__file__).parent / "porta_entries.json"
 
 
 def load_porta() -> list[dict]:
+    """Carrega entradas Porta — do Supabase (modo multi-user) ou do JSON local."""
+    if _SB_MODE and _sb_user:
+        try:
+            resp = _sb.table("porta_entries").select("*").eq("user_id", _sb_user.id).order("added_at").execute()
+            return [
+                {
+                    "event_name":  r["event_name"],
+                    "tickets":     r["tickets"],
+                    "revenue_brl": float(r["revenue_brl"]),
+                    "source":      r["source"],
+                    "added_at":    r.get("added_at", ""),
+                    **({"prices":  r["prices"]}      if r.get("prices")     else {}),
+                    **({"date":    r["entry_date"]}  if r.get("entry_date") else {}),
+                }
+                for r in (resp.data or [])
+            ]
+        except Exception:
+            pass  # fallback to local JSON on error
     if not PORTA_PATH.is_file():
         return []
     try:
@@ -156,6 +224,15 @@ def load_porta() -> list[dict]:
 
 
 def save_porta(entries: list[dict]) -> None:
+    """Salva entradas Porta. Em modo Supabase, `save_porta([])` limpa o registro do usuário."""
+    if _SB_MODE and _sb_user:
+        if not entries:
+            try:
+                _sb.table("porta_entries").delete().eq("user_id", _sb_user.id).execute()
+            except Exception as e:
+                st.error(f"Erro ao limpar Porta no banco: {e}")
+        # Upsert de lista não-vazia não é chamado diretamente (append_porta_entry insere linha a linha)
+        return
     PORTA_PATH.write_text(
         json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -169,6 +246,26 @@ def append_porta_entry(
     prices: list[float] | None = None,
     entry_date=None,
 ) -> None:
+    """Adiciona uma entrada Porta — no Supabase ou no JSON local."""
+    if _SB_MODE and _sb_user:
+        try:
+            row: dict = {
+                "user_id":     _sb_user.id,
+                "event_name":  event_name,
+                "tickets":     int(tickets),
+                "revenue_brl": float(revenue_brl),
+                "source":      source,
+                "added_at":    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            if prices:
+                row["prices"] = [float(p) for p in prices]
+            if entry_date is not None:
+                row["entry_date"] = entry_date.isoformat() if hasattr(entry_date, "isoformat") else str(entry_date)
+            _sb.table("porta_entries").insert(row).execute()
+        except Exception as e:
+            st.error(f"Erro ao salvar entrada Porta no banco: {e}")
+        return
+    # Fallback: JSON local
     entries = load_porta()
     record: dict = {
         "event_name": event_name,
@@ -270,23 +367,203 @@ def expand_porta_to_rows(entries: list[dict], shotgun_df: pd.DataFrame | None = 
     return pd.DataFrame(rows)
 
 
+# ── Supabase: inicialização, OAuth callback, restauração de sessão ─────────────
+# (_SB_INIT — roda a cada rerun antes do sidebar)
+
+def _sb_is_configured() -> bool:
+    if not _SB_AVAIL:
+        return False
+    try:
+        return bool(st.secrets.get("supabase", {}).get("url"))
+    except Exception:
+        return False
+
+
+def _render_login_page() -> None:
+    """Página standalone de login — Google OAuth ou visitante."""
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown(
+            "<h1 style='text-align:center'>🎟️ Clubber Analytics</h1>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<p style='text-align:center;color:#9a9ab0'>Painel de análise de eventos.</p>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+        # ── Google OAuth (PKCE flow) ──────────────────────────────────────────
+        try:
+            _base_redir = st.secrets.get("supabase", {}).get("redirect_url", "http://localhost:8501").rstrip("/")
+
+            # 1. Pede URL ao supabase-py — ele gera o code_challenge internamente
+            _oa = _sb.auth.sign_in_with_oauth({
+                "provider": "google",
+                "options": {"redirect_to": f"{_base_redir}/"},
+            })
+
+            # 2. Extrai o verifier que o supabase-py guardou no storage interno
+            #    (chave padrão: "{storage_key}-code-verifier")
+            _ver = None
+            try:
+                _sk  = _sb.auth._storage_key
+                _ver = _sb.auth._storage.get_item(f"{_sk}-code-verifier")
+            except Exception:
+                pass
+
+            # 3. Reconstrói a URL embutindo o verifier no redirect_to para que
+            #    volte como ?sb_ver= após o OAuth — sem depender de session_state.
+            if _ver:
+                _parsed = urlparse(_oa.url)
+                _qp = dict(parse_qsl(_parsed.query))
+                _qp["redirect_to"] = f"{_base_redir}/?sb_ver={_ver}"
+                _oauth_url = _parsed._replace(query=urlencode(_qp)).geturl()
+            else:
+                _oauth_url = _oa.url   # fallback sem PKCE
+
+            st.link_button("🔑 Entrar com Google", url=_oauth_url, use_container_width=True, type="primary")
+            st.caption("Seus dados ficam salvos e sincronizados entre sessões.")
+        except Exception as e:
+            st.error(f"Não foi possível iniciar autenticação Google: {e}")
+
+        st.divider()
+
+        # ── Visitante ─────────────────────────────────────────────────────────
+        if st.button("👤 Continuar como visitante", use_container_width=True, key="li_guest"):
+            st.session_state["sb_guest"] = True
+            st.rerun()
+        st.caption("Modo visitante: dados não são salvos entre sessões.")
+
+
+if _sb_is_configured():
+    # Cria client sem sessão
+    _sb = _sb_create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
+    _SB_MODE = True
+
+    # ── PKCE callback: ?code= + ?sb_ver= chegam juntos na query string ────────
+    # (o verifier foi embutido no redirect_to URL, então volta com o code)
+    _pkce_code = st.query_params.get("code")
+    _pkce_ver  = st.query_params.get("sb_ver")
+    if _pkce_code and _pkce_ver:
+        try:
+            _pkce_resp = _sb.auth.exchange_code_for_session(
+                {"auth_code": _pkce_code, "code_verifier": _pkce_ver}
+            )
+            st.session_state["sb_access_token"]  = _pkce_resp.session.access_token
+            st.session_state["sb_refresh_token"] = _pkce_resp.session.refresh_token
+            st.query_params.clear()
+            st.rerun()
+        except Exception as _pkce_err:
+            st.error(f"Erro ao completar login com Google: {_pkce_err}")
+            st.query_params.clear()
+            st.stop()
+
+    # Erros OAuth retornados pelo Supabase/Google (?error=...)
+    _oauth_err = st.query_params.get("error")
+    if _oauth_err:
+        st.error(
+            f"Erro no login com Google: "
+            f"{st.query_params.get('error_description', _oauth_err)}"
+        )
+        st.query_params.clear()
+
+    # Restaura sessão do session_state
+    _at = st.session_state.get("sb_access_token")
+    _rt = st.session_state.get("sb_refresh_token", "")
+    if _at:
+        try:
+            _sb.auth.set_session(_at, _rt)
+            _sb_user = _sb.auth.get_user().user
+        except Exception:
+            st.session_state.pop("sb_access_token", None)
+            st.session_state.pop("sb_refresh_token", None)
+            _sb_user = None
+
+    # ── Auth gate ──────────────────────────────────────────────────────────────
+    if _sb_user is None and not st.session_state.get("sb_guest"):
+        _render_login_page()
+        st.stop()
+
+    # ── Migração única: porta_entries.json → DB ────────────────────────────────
+    _migrated_flag = PORTA_PATH.with_name("porta_entries.imported.json")
+    if PORTA_PATH.is_file() and not _migrated_flag.is_file():
+        try:
+            _local_entries = json.loads(PORTA_PATH.read_text(encoding="utf-8"))
+            if _local_entries:
+                _chk = _sb.table("porta_entries").select("id").eq("user_id", _sb_user.id).limit(1).execute()
+                if not _chk.data:
+                    for _e in _local_entries:
+                        _row: dict = {
+                            "user_id":     _sb_user.id,
+                            "event_name":  _e["event_name"],
+                            "tickets":     int(_e["tickets"]),
+                            "revenue_brl": float(_e["revenue_brl"]),
+                            "source":      _e.get("source", "manual"),
+                            "added_at":    _e.get("added_at", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")),
+                        }
+                        if _e.get("prices"):
+                            _row["prices"] = _e["prices"]
+                        if _e.get("date"):
+                            _row["entry_date"] = _e["date"]
+                        _sb.table("porta_entries").insert(_row).execute()
+                    PORTA_PATH.rename(_migrated_flag)
+                    st.toast(f"Importadas {len(_local_entries)} entradas Porta para sua conta. ✓")
+        except Exception as _me:
+            st.warning(f"Migração de dados locais falhou (não crítico): {_me}")
+
+    # ── Carrega ingressos Shotgun do banco (se df ainda não estiver em memória) ─
+    if "df" not in st.session_state:
+        try:
+            _db_resp = _sb.table("shotgun_tickets").select("raw").eq("user_id", _sb_user.id).execute()
+            if _db_resp.data:
+                _db_recs = [row["raw"] for row in _db_resp.data]
+                st.session_state["df"] = process(pd.DataFrame(_db_recs))
+                st.session_state["source_label"] = f"Base de dados — {len(_db_recs):,} ingressos"
+        except Exception as _dbe:
+            pass  # silencioso; usuário pode buscar via API
+
+
 # ── Sidebar esquerda — fonte de dados ─────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🎟️ Shotgun Analytics")
+    st.markdown("## 🎟️ Clubber Analytics")
     st.caption("feito por [ponkan](https://linktr.ee/ponkan_)")
+
+    if _SB_MODE:
+        if _sb_user:
+            st.caption(f"👤 {_sb_user.email}")
+        else:
+            st.caption("👤 Visitante")
+        if st.button("Sair", use_container_width=True, key="sb_signout"):
+            try:
+                if _sb_user:
+                    _sb.auth.sign_out()
+            except Exception:
+                pass
+            for _k in ["sb_access_token", "sb_refresh_token", "df", "source_label",
+                        "_consolidated_processed", "sb_guest"]:
+                st.session_state.pop(_k, None)
+            for _k in [k for k in st.session_state if k.startswith("evt_")]:
+                del st.session_state[_k]
+            st.rerun()
 
     if "df" in st.session_state:
         if st.button("🚪 Limpar dados", use_container_width=True):
             del st.session_state["df"]
             st.session_state.pop("source_label", None)
+            if _SB_MODE and _sb_user:
+                try:
+                    _sb.table("shotgun_tickets").delete().eq("user_id", _sb_user.id).execute()
+                except Exception:
+                    pass
             st.rerun()
 
     st.divider()
 
     st.markdown("### Buscar via API")
     st.caption("[Como descobrir os seus dados de API](https://support-pro.shotgun.live/hc/en-us/articles/33561354477970-Find-your-Organizer-id-and-API-token#h_01KJ7K6DYV1FWN0AD6NRV5W1XE)")
-    api_token    = st.text_input("Token de API", type="password", placeholder="eyJhbGci...")
     organizer_id = st.text_input("ID do Organizador", placeholder="123456")
+    api_token    = st.text_input("Token de API", type="password", placeholder="eyJhbGci...")
 
     if st.button("🔄 Buscar Dados", use_container_width=True, type="primary"):
         if not api_token or not organizer_id:
@@ -296,10 +573,79 @@ with st.sidebar:
             try:
                 with st.spinner("Conectando à API do Shotgun..."):
                     raw = fetch_tickets_from_api(api_token, organizer_id, progress=prog)
-                st.session_state["df"] = process(raw)
-                st.session_state["source_label"] = f"API ao vivo — {len(raw):,} ingressos"
                 prog.empty()
-                st.success(f"{len(raw):,} ingressos carregados com sucesso.")
+
+                if _SB_MODE and _sb_user and not raw.empty:
+                    try:
+                        with st.spinner("Verificando ingressos já salvos..."):
+                            # ── Step 1: fetch existing ticket_ids from DB (IDs only, fast) ──
+                            _exist_resp = _sb.table("shotgun_tickets") \
+                                .select("ticket_id") \
+                                .eq("user_id", _sb_user.id) \
+                                .execute()
+                            _existing_ids = {r["ticket_id"] for r in (_exist_resp.data or [])}
+
+                        # ── Step 2: split API result into new vs already-stored ──────────
+                        _all_recs = raw.to_dict("records")
+                        _new_recs = [
+                            r for i, r in enumerate(_all_recs)
+                            if str(r.get("ticket_id", i)) not in _existing_ids
+                        ]
+                        _n_existing = len(_existing_ids)
+                        _n_new      = len(_new_recs)
+
+                        # ── Step 3: upsert ONLY genuinely new tickets ────────────────────
+                        if _new_recs:
+                            with st.spinner(f"Salvando {_n_new:,} novos ingressos..."):
+                                _upsert_rows = [
+                                    {
+                                        "user_id":   _sb_user.id,
+                                        "ticket_id": str(r.get("ticket_id", i)),
+                                        "raw":       _sanitize_record(r),
+                                    }
+                                    for i, r in enumerate(_new_recs)
+                                ]
+                                _sb.table("shotgun_tickets") \
+                                    .upsert(_upsert_rows, on_conflict="user_id,ticket_id") \
+                                    .execute()
+
+                        # ── Step 4: rebuild df = existing DB rows + new API rows ─────────
+                        # Reload full dataset from DB so df is always the single source of truth.
+                        with st.spinner("Carregando dados atualizados..."):
+                            _full_resp = _sb.table("shotgun_tickets") \
+                                .select("raw") \
+                                .eq("user_id", _sb_user.id) \
+                                .execute()
+                            _full_recs = [row["raw"] for row in (_full_resp.data or [])]
+                            st.session_state["df"] = process(pd.DataFrame(_full_recs))
+
+                        total_in_db = _n_existing + _n_new
+                        st.session_state["source_label"] = f"Base de dados — {total_in_db:,} ingressos"
+
+                        if _n_new:
+                            st.success(
+                                f"✓ {_n_new:,} novos ingressos adicionados. "
+                                f"{_n_existing:,} já estavam salvos. "
+                                f"Total: {total_in_db:,}."
+                            )
+                        else:
+                            st.info(
+                                f"Nenhum ingresso novo encontrado. "
+                                f"{_n_existing:,} ingressos já estavam salvos."
+                            )
+
+                    except Exception as _ue:
+                        # Fallback: at least show API data in session, even if DB failed
+                        st.session_state["df"] = process(raw)
+                        st.session_state["source_label"] = f"API ao vivo — {len(raw):,} ingressos"
+                        st.warning(f"Dados carregados, mas não foi possível sincronizar com o banco: {_ue}")
+
+                else:
+                    # Guest / no-DB mode: just use the API response directly
+                    st.session_state["df"] = process(raw)
+                    st.session_state["source_label"] = f"API ao vivo — {len(raw):,} ingressos"
+                    st.success(f"{len(raw):,} ingressos carregados com sucesso.")
+
             except requests.Timeout as e:
                 st.error(f"⏱️ {e}")
             except requests.HTTPError as e:
@@ -493,7 +839,7 @@ if "df" not in st.session_state:
     _, col, _ = st.columns([1, 2, 1])
     with col:
         st.markdown(
-            "<h1 style='text-align:center'>🎟️ Shotgun Analytics</h1>",
+            "<h1 style='text-align:center'>🎟️ Clubber Analytics</h1>",
             unsafe_allow_html=True,
         )
         st.markdown(
